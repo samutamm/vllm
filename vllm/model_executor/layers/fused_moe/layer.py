@@ -535,6 +535,19 @@ class FusedMoE(CustomOp):
                     self.layer_id, topk_ids
                 )
 
+        # For MORI-EP (EP without DP), use scheduler's max_num_batched_tokens
+        # instead of the DP chunk size, as MORI needs to handle full batches
+        moe_max_num_tokens = envs.VLLM_MOE_DP_CHUNK_SIZE
+        if (self.moe_parallel_config.use_ep
+            and self.moe_parallel_config.all2all_backend == "mori"
+            and self.moe_parallel_config.dp_size == 1):
+            # Use scheduler's max_num_batched_tokens for MORI-EP without DP
+            moe_max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            logger.info(
+                "MORI-EP: Using max_num_tokens=%d from scheduler config",
+                moe_max_num_tokens
+            )
+
         self.router = create_fused_moe_router(
             top_k=top_k,
             global_num_experts=self.global_num_experts,
@@ -564,7 +577,7 @@ class FusedMoE(CustomOp):
             moe_parallel_config=self.moe_parallel_config,
             in_dtype=moe_in_dtype,
             router_logits_dtype=router_logits_dtype,
-            max_num_tokens=envs.VLLM_MOE_DP_CHUNK_SIZE,
+            max_num_tokens=moe_max_num_tokens,
             has_bias=has_bias,
             is_act_and_mul=is_act_and_mul,
             is_lora_enabled=vllm_config.lora_config is not None,
@@ -746,7 +759,7 @@ class FusedMoE(CustomOp):
         return (
             self.moe_parallel_config.use_pplx_kernels
             or self.moe_parallel_config.use_deepep_ll_kernels
-            or self.moe_parallel_config.use_mori_kernels
+            or (self.dp_size > 1 and self.moe_parallel_config.use_mori_kernels)
             or (self.dp_size > 1 and self.use_flashinfer_cutlass_kernels)
         ) and envs.VLLM_ENABLE_MOE_DP_CHUNK
 
@@ -1540,7 +1553,11 @@ class FusedMoE(CustomOp):
         """
         Some combine kernels reduce across GPU ranks by default.
         """
-        if self.must_reduce_shared_expert_outputs():
+        uses_mori_ep = (
+            self.moe_parallel_config is not None
+            and self.moe_parallel_config.all2all_backend == "mori"
+        )
+        if self.must_reduce_shared_expert_outputs() or uses_mori_ep:
             return final_hidden_states
         else:
             return tensor_model_parallel_all_reduce(final_hidden_states)
@@ -1609,9 +1626,9 @@ class FusedMoE(CustomOp):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
-        return (
-            self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
-        )
+        if self.rocm_aiter_fmoe_enabled:
+            return None
+        return self._expert_map
 
     def forward_cuda(
         self,
