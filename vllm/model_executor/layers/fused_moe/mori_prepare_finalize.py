@@ -23,12 +23,16 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         max_tokens_per_rank: int,
         num_dispatchers: int,
         use_fp8_dispatch: bool = False,
+        use_dp: bool = True,
     ):
         super().__init__()
         self.mori_op = mori_op
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        self.use_dp = use_dp
+        self.rank = torch.tensor([torch.distributed.get_rank()], dtype=torch.int32, device=torch.cuda.current_device(), requires_grad=False)
+
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -83,13 +87,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 quant_func = get_hip_quant(QuantType.per_Token)
                 a1, scale = quant_func(a1, quant_dtype=current_platform.fp8_dtype())
 
-        (
-            dispatch_a1,
-            dispatch_weights,
-            dispatch_scale,
-            dispatch_ids,
-            dispatch_recv_token_num,
-        ) = self.mori_op.dispatch(a1, topk_weights, scale, topk_ids)
+        if self.use_dp:
+            (
+                dispatch_a1,
+                dispatch_weights,
+                dispatch_scale,
+                dispatch_ids,
+                dispatch_recv_token_num,
+            ) = self.mori_op.dispatch(a1, topk_weights, scale, topk_ids)
+        else:
+            dispatch_a1 = a1
+            dispatch_weights = topk_weights
+            dispatch_scale = scale
+            dispatch_ids = topk_ids
+            dispatch_recv_token_num = self.rank
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
@@ -113,9 +124,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
         num_token = output.shape[0]
-        result = self.mori_op.combine(
-            fused_expert_output,
-            None,
-            topk_ids,
-        )[0]
+        if self.use_dp:
+            result = self.mori_op.combine(
+                fused_expert_output,
+                None,
+                topk_ids,
+            )[0]
+        else:
+            result = fused_expert_output
         output.copy_(result[:num_token])

@@ -201,6 +201,7 @@ def maybe_make_prepare_finalize(
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=all2all_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
+            use_dp=all2all_manager.dp_world_size > 1,
         )
 
     return prepare_finalize
