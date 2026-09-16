@@ -63,6 +63,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
+from vllm.models.kimi_k3.amd.low_latency_gemm import enable_kimi_k3_low_latency_gemm
 from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
 from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.sequence import IntermediateTensors
@@ -1007,6 +1008,7 @@ class KimiLinearForCausalLM(
             )
         else:
             self.lm_head = PPMissingLayer()
+        enable_kimi_k3_low_latency_gemm(self, self.model_config.dtype)
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=logit_scale
