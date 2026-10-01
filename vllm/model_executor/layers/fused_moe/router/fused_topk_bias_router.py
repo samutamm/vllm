@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 
 import torch
 
@@ -157,6 +158,35 @@ def fused_topk_bias(
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
 ):
+    n_routed_experts = gating_output.shape[-1]
+    if (
+        scoring_func == "softmax"
+        and os.environ.get("AITER_USE_FUSED_TOPK_MOE_SORT", "0").lower()
+        in ("1", "true", "yes")
+        and hidden_states.size(0) <= 16
+        and n_routed_experts == 896
+        and topk == 16
+        and bias_vl is None
+        and hash_indices_table is None
+    ):
+        try:
+            from aiter.ops.flydsl.moe_sorting import fused_topk_gating
+
+            topk_weights, topk_indices = fused_topk_gating(
+                gating_output,
+                e_score_correction_bias,
+                topk=topk,
+                scoring_func="softmax",
+                need_renorm=renormalize,
+            )
+            if routed_scaling_factor != 1.0:
+                topk_weights = topk_weights * routed_scaling_factor
+            return topk_weights, topk_indices.to(
+                torch.int32 if indices_type is None else indices_type
+            )
+        except Exception:
+            pass  # Fall back to the baseline path below, unmodified.
+
     if (
         input_tokens is not None
         and hash_indices_table is not None
