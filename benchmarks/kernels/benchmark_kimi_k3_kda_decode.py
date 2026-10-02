@@ -31,6 +31,7 @@ CONV_WIDTH = 4
 GATE_LOWER_BOUND = -5.0
 NORM_EPS = 1e-5
 NUM_KDA_LAYERS = 69
+HIDDEN_SIZE = 7168
 DTYPE = torch.bfloat16
 
 
@@ -136,6 +137,18 @@ class Inputs:
         """Recurrent-state traffic, identical for both implementations."""
         return self.num_tokens * self.num_heads * HEAD_DIM * HEAD_DIM * 4 * 2
 
+    def add_oproj(self) -> None:
+        """Extra tensors for --with-oproj: a plain matmul stands in for
+        `o_proj` (`RowParallelLinear`), same GEMM shape, no process group."""
+        device = self.out.device
+        dim = self.num_heads * HEAD_DIM
+        self.oproj_weight = torch.randn(
+            HIDDEN_SIZE, dim, device=device, dtype=DTYPE
+        )
+        self.oproj_out = torch.empty(
+            self.num_tokens, HIDDEN_SIZE, device=device, dtype=DTYPE
+        )
+
 
 def _gated_rmsnorm(
     x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float
@@ -217,6 +230,16 @@ def fused(inp: Inputs) -> None:
     )
 
 
+def oproj_only(inp: Inputs) -> None:
+    core_attn_out = inp.out.view(inp.num_tokens, inp.num_heads * HEAD_DIM)
+    torch.matmul(core_attn_out, inp.oproj_weight.t(), out=inp.oproj_out)
+
+
+def fused_plus_oproj(inp: Inputs) -> None:
+    fused(inp)
+    oproj_only(inp)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 8, 32, 64, 128])
@@ -249,7 +272,18 @@ def main() -> None:
         default="SD",
         help="physical conv-state cache layout",
     )
+    parser.add_argument(
+        "--with-oproj",
+        action="store_true",
+        help=(
+            "also time kda_decode_fusion_kernel immediately followed by a "
+            "matmul standing in for o_proj, isolating combined_us - "
+            "(fused_us + oproj_us). Not compatible with --graph."
+        ),
+    )
     args = parser.parse_args()
+    if args.with_oproj and args.graph:
+        raise SystemExit("--with-oproj does not support --graph yet")
 
     if not hasattr(torch.ops._C, "fused_kda_decode"):
         raise SystemExit("vLLM was built without the fused KDA decode kernel")
@@ -261,12 +295,32 @@ def main() -> None:
         f"device: {props.name} ({props.gcnArchName})  timing: {mode}  "
         f"layout: {args.layout}"
     )
-    print(
-        f"{'heads':>6} {'tokens':>7} {'eager-norm':>11} {'triton-norm':>12} "
-        f"{'fused us':>9} {'speedup':>8} {'state TB/s':>11} {'saved ms/step':>14}"
-    )
+    if args.with_oproj:
+        print(
+            f"{'heads':>6} {'tokens':>7} {'fused_us':>9} {'oproj_us':>9} "
+            f"{'sum_us':>8} {'combined_us':>12} {'gap_us':>8}"
+        )
+    else:
+        print(
+            f"{'heads':>6} {'tokens':>7} {'eager-norm':>11} {'triton-norm':>12} "
+            f"{'fused us':>9} {'speedup':>8} {'state TB/s':>11} {'saved ms/step':>14}"
+        )
     for num_heads in args.heads:
         for num_tokens in args.tokens:
+            if args.with_oproj:
+                inp = Inputs(num_tokens, num_heads, args.layout)
+                inp.add_oproj()
+                fused_ms = bench(functools.partial(fused, inp))
+                oproj_ms = bench(functools.partial(oproj_only, inp))
+                combined_ms = bench(functools.partial(fused_plus_oproj, inp))
+                sum_ms = fused_ms + oproj_ms
+                gap_ms = combined_ms - sum_ms
+                print(
+                    f"{num_heads:>6} {num_tokens:>7} {fused_ms * 1e3:>9.2f} "
+                    f"{oproj_ms * 1e3:>9.2f} {sum_ms * 1e3:>8.2f} "
+                    f"{combined_ms * 1e3:>12.2f} {gap_ms * 1e3:>8.2f}"
+                )
+                continue
             if args.graph and args.layers > 1:
                 layers = [
                     Inputs(num_tokens, num_heads, args.layout)
@@ -296,13 +350,19 @@ def main() -> None:
                 f"{triton_ms * 1e3:>12.2f} {fused_ms * 1e3:>9.2f} "
                 f"{triton_ms / fused_ms:>7.2f}x {bandwidth:>10.2f} {saved:>14.3f}"
             )
-    print(
-        f"\n'eager-norm' is the chain as it runs today (FusedRMSNormGated falls "
-        f"back to ~10 eager ops when custom_ops are off);\n'triton-norm' uses the "
-        f"Triton rms_norm_gated kernel, which is the honest baseline for this "
-        f"fusion.\nspeedup and saved ms/step are against 'triton-norm', over "
-        f"{NUM_KDA_LAYERS} KDA layers per forward pass."
-    )
+    if args.with_oproj:
+        print(
+            "\n'gap_us' = combined_us - (fused_us + oproj_us): the launch/gap "
+            "overhead between the two kernels that a real fusion would remove."
+        )
+    else:
+        print(
+            f"\n'eager-norm' is the chain as it runs today (FusedRMSNormGated falls "
+            f"back to ~10 eager ops when custom_ops are off);\n'triton-norm' uses the "
+            f"Triton rms_norm_gated kernel, which is the honest baseline for this "
+            f"fusion.\nspeedup and saved ms/step are against 'triton-norm', over "
+            f"{NUM_KDA_LAYERS} KDA layers per forward pass."
+        )
 
 
 if __name__ == "__main__":
