@@ -1621,6 +1621,18 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
             max_token_num,
             config.scheduler_config.max_num_batched_tokens,
         )
+        if rocm_aiter_ops.is_flydsl_quick_reduce_enabled():
+            max_decode_tokens = 512
+            if (
+                config.compilation_config is not None
+                and getattr(
+                    config.compilation_config, "max_cudagraph_capture_size", None
+                )
+                is not None
+                and config.compilation_config.max_cudagraph_capture_size > 0
+            ):
+                max_decode_tokens = config.compilation_config.max_cudagraph_capture_size
+            self.max_token_num = min(self.max_token_num, max_decode_tokens)
 
         # Only register the AR+RMS+per-group-FP8-quant patterns when the
         # running aiter exposes the kernel. Older aiter builds (pre PR #2823)

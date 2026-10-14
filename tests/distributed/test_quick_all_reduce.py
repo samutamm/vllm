@@ -439,35 +439,35 @@ def test_quick_allreduce_flydsl_rmsnorm_delegation():
     fake_fly = FakeFlyRMS()
     quick_reduce._fly_rms = fake_fly
 
-    assert hasattr(quick_reduce, "_FLY_FUSED_MIN_TOKENS")
-    assert quick_reduce._FLY_FUSED_MIN_TOKENS == 16
-
-    # Sub-threshold: M=4 (< 16) -> declined by token gating
-    inp_sub = torch.randn(4, 7168, dtype=torch.bfloat16)
-    res_sub = torch.randn_like(inp_sub)
-    weight = torch.randn(7168, dtype=torch.bfloat16)
-    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_sub, res_sub, weight)
-
-    # Eligible: M=16 (>= 16 and <= 24) -> accepted
-    inp_eligible = torch.randn(16, 7168, dtype=torch.bfloat16)
-    res_eligible = torch.randn_like(inp_eligible)
-    assert quick_reduce.should_fly_allreduce_rmsnorm(inp_eligible, res_eligible, weight)
-
-    # Oversized for backend: M=32 (> 24) -> declined by FakeFlyRMS
+    inp_small = torch.randn(4, 7168, dtype=torch.bfloat16)
     inp_large = torch.randn(32, 7168, dtype=torch.bfloat16)
-    res_large = torch.randn_like(inp_large)
-    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_large, res_large, weight)
+    inp_prefill = torch.randn(1024, 7168, dtype=torch.bfloat16)
+    inp_empty = torch.randn(0, 7168, dtype=torch.bfloat16)
+    residual = torch.randn_like(inp_small)
+    weight = torch.randn(7168, dtype=torch.bfloat16)
+
+    assert quick_reduce.should_fly_allreduce_rmsnorm(inp_small, residual, weight)
+    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_large, residual, weight)
+    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_prefill, residual, weight)
+    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_empty, residual, weight)
+
+    # Verify custom max tokens gating
+    quick_reduce._FLY_FUSED_MAX_TOKENS = 6
+    assert quick_reduce.should_fly_allreduce_rmsnorm(inp_small, residual, weight)
+    inp_seven = torch.randn(7, 7168, dtype=torch.bfloat16)
+    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_seven, residual, weight)
+    quick_reduce._FLY_FUSED_MAX_TOKENS = 512
 
     out, res_out = quick_reduce.quick_all_reduce_rmsnorm(
-        inp_eligible, res_eligible, weight, 1e-6, 7168
+        inp_small, residual, weight, 1e-6, 7168
     )
-    torch.testing.assert_close(out, inp_eligible + 2)
-    torch.testing.assert_close(res_out, res_eligible + 3)
+    torch.testing.assert_close(out, inp_small + 2)
+    torch.testing.assert_close(res_out, residual + 3)
 
     with pytest.raises(
         RuntimeError, match="FlyDSL fused AR\\+RMSNorm was called when not eligible"
     ):
-        quick_reduce.quick_all_reduce_rmsnorm(inp_large, res_large, weight, 1e-6, 7168)
+        quick_reduce.quick_all_reduce_rmsnorm(inp_large, residual, weight, 1e-6, 7168)
 
     assert quick_reduce.prime_fly_fused_rmsnorm(7168) is True
     assert fake_fly.primed == [7168]
@@ -475,6 +475,32 @@ def test_quick_allreduce_flydsl_rmsnorm_delegation():
     quick_reduce.close()
     assert fake_fly.closed is True
     assert quick_reduce._fly_rms is None
+
+
+def test_quick_allreduce_init_flydsl_capture_size_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    quick_reduce = _make_quick_allreduce_for_test()
+    quick_reduce.group = object()
+    quick_reduce.device = torch.device("cpu")
+    quick_reduce.rank = 0
+    monkeypatch.setattr(
+        aiter_ops.rocm_aiter_ops,
+        "is_flydsl_quick_reduce_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        aiter_ops.rocm_aiter_ops,
+        "create_flydsl_allreduce_rmsnorm",
+        lambda **kwargs: SimpleNamespace(close=lambda: None),
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(get_hidden_size=lambda: 7168),
+        compilation_config=SimpleNamespace(max_cudagraph_capture_size=256),
+    )
+    quick_reduce._init_flydsl(vllm_config)
+    assert quick_reduce._FLY_FUSED_MAX_TOKENS == 256
+    assert quick_reduce._fly_rms is not None
 
 
 def test_rocm_aiter_fused_rmsnorm_dispatches_flydsl_fused_rmsnorm(
