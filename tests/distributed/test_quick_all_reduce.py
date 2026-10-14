@@ -549,17 +549,89 @@ def test_rocm_aiter_fused_rmsnorm_dispatches_flydsl_fused_rmsnorm(
     torch.testing.assert_close(res_out, residual + 20)
 
 
-def test_rocm_aiter_fused_rmsnorm_falls_back_to_separate_cdr_for_large_decode(
+def test_rocm_aiter_fused_rmsnorm_dispatches_2stage_custom_ar(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    calls = []
+
+    class FakeAiterCA:
+        world_size = 8
+        fully_connected = True
+
+        def custom_fused_ar_rms(
+            self, inp, residual, weight, epsilon, *, use_1stage, gemma_norm
+        ):
+            calls.append(
+                {
+                    "inp": inp,
+                    "residual": residual,
+                    "weight": weight,
+                    "eps": epsilon,
+                    "use_1stage": use_1stage,
+                    "gemma_norm": gemma_norm,
+                }
+            )
+            return inp + 10, residual + 20
+
     class FakeAiterAllReduce:
-        aiter_ca = SimpleNamespace(world_size=8, fully_connected=True)
+        aiter_ca = FakeAiterCA()
 
         def use_1stage_fused_ar_rms(self, inp):
             return False
 
+    class FakeQuickReduce:
+        disabled = False
+
+        def should_fly_allreduce_rmsnorm(self, inp, residual, weight):
+            return False
+
+        def should_quick_allreduce(self, inp):
+            return False
+
+    qr_comm = FakeQuickReduce()
+    device_comm = SimpleNamespace(cpu_group=object(), qr_comm=qr_comm)
+    monkeypatch.setattr(
+        vllm_distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=device_comm),
+    )
+    monkeypatch.setattr(
+        aiter_ops.rocm_aiter_ops,
+        "get_aiter_allreduce",
+        lambda: FakeAiterAllReduce(),
+    )
+
+    inp = torch.randn(1024, 7168, dtype=torch.bfloat16)
+    residual = torch.randn_like(inp)
+    weight = torch.randn(7168, dtype=torch.bfloat16)
+
+    out, res_out = aiter_ops._rocm_aiter_fused_allreduce_rmsnorm_impl(
+        inp, residual, weight, 1e-6
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["inp"] is inp
+    assert calls[0]["use_1stage"] is False
+    assert calls[0]["gemma_norm"] is False
+    torch.testing.assert_close(out, inp + 10)
+    torch.testing.assert_close(res_out, residual + 20)
+
+
+def test_rocm_aiter_fused_rmsnorm_falls_back_to_separate_cdr_for_large_decode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeAiterCA:
+        world_size = 8
+        fully_connected = True
+
         def custom_fused_ar_rms(self, *args, **kwargs):
-            raise AssertionError("2-stage fused CDR should not be called!")
+            return None
+
+    class FakeAiterAllReduce:
+        aiter_ca = FakeAiterCA()
+
+        def use_1stage_fused_ar_rms(self, inp):
+            return False
 
     class FakeQuickReduce:
         disabled = False

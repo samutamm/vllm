@@ -1175,23 +1175,12 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
                 )
                 return out, residual_out
 
-        # Outside 1-stage CDR and HIP QR, fall back to separate CDR + RMSNorm.
-        from vllm.distributed import tensor_model_parallel_all_reduce
-
-        return torch.ops.vllm_aiter.fused_add_rms_norm(
-            tensor_model_parallel_all_reduce(input_),
-            residual,
-            weight,
-            epsilon,
-            gemma_norm,
-        )
-
     result = ca.custom_fused_ar_rms(
         input_,
         residual,
         weight,
         epsilon,
-        use_1stage=True,
+        use_1stage=use_1stage,
         gemma_norm=gemma_norm,
     )
     if result is None:
