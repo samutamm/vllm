@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from enum import Enum
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -9,6 +11,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
@@ -42,6 +45,11 @@ MB = 1024 * KB
 
 
 class QuickAllReduce:
+    _fly_rms: Any = None
+    # Minimum tokens required for FlyDSL fused AR+RMSNorm to outperform
+    # separate Cross-Device Reduce + RMSNorm on CDNA architectures.
+    # Below this threshold, launch overhead and CU under-utilization dominate.
+    _FLY_FUSED_MIN_TOKENS: int = 16
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
@@ -256,7 +264,28 @@ class QuickAllReduce:
                 self.qr_quantization_min_size // KB,
             )
         self.create_shared_buffer()
+        if envs.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL:
+            self._init_flydsl(vllm_config)
         self.disabled = False
+
+    def _init_flydsl(self, vllm_config=None):
+        if not rocm_aiter_ops.is_flydsl_quick_reduce_enabled():
+            logger.warning(
+                "VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL requires VLLM_ROCM_USE_AITER=1; "
+                "using the HIP QuickReduce kernels."
+            )
+            return
+
+        # Fused AR+RMSNorm operates on bit-exact BF16, independent of qr_quant_level
+        hiddens = ()
+        if vllm_config is not None and vllm_config.model_config is not None:
+            with contextlib.suppress(Exception):
+                hiddens = (vllm_config.model_config.get_hidden_size(),)
+        self._fly_rms = rocm_aiter_ops.create_flydsl_allreduce_rmsnorm(
+            group=self.group,
+            device=self.device,
+            hiddens=hiddens,
+        )
 
     @staticmethod
     def _get_qr_min_size(qr_max_size: int | None) -> int | None:
@@ -353,7 +382,47 @@ class QuickAllReduce:
             return QuickReduceRegime.FP.value
         return self.qr_quant_level.value
 
+    def should_fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Whether the FlyDSL fused AR+RMSNorm backend can serve this call."""
+        if self._fly_rms is None:
+            return False
+
+        # Guard against small token counts where unfused path has higher throughput
+        hidden_dim = inp.shape[-1]
+        num_tokens = inp.numel() // hidden_dim
+        if num_tokens < self._FLY_FUSED_MIN_TOKENS:
+            return False
+
+        return self._fly_rms.should_fly_fused_ar_rms(inp, residual_inp, weight)
+
+    def quick_all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        hidden_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Performs FlyDSL fused all-reduce with residual add and RMSNorm."""
+        if self.should_fly_allreduce_rmsnorm(inp, residual_inp, weight):
+            return self._fly_rms.fly_fused_ar_rms(inp, residual_inp, weight, eps)
+        raise RuntimeError("FlyDSL fused AR+RMSNorm was called when not eligible")
+
+    def prime_fly_fused_rmsnorm(self, hidden_dim: int) -> bool:
+        """Pre-allocates inboxes and JIT-compiles fused AR+RMSNorm for hidden_dim."""
+        if self._fly_rms is None:
+            return False
+        return self._fly_rms.prime(hidden_dim)
+
     def close(self):
+        if self._fly_rms is not None:
+            self._fly_rms.close()
+            self._fly_rms = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)

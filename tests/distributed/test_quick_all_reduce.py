@@ -8,7 +8,17 @@ import types
 from types import SimpleNamespace
 
 import pytest
-import ray
+
+try:
+    import ray
+except ImportError:
+
+    class _FakeRay:
+        @staticmethod
+        def remote(*args, **kwargs):
+            return lambda fn: fn
+
+    ray = _FakeRay()
 import torch
 import torch.distributed as dist
 
@@ -403,6 +413,191 @@ def test_rocm_aiter_fused_rmsnorm_keeps_1stage_decode_path(
     assert calls[0]["gemma_norm"] is False
     torch.testing.assert_close(out, inp + 1)
     torch.testing.assert_close(residual_out, residual + 1)
+
+
+def test_quick_allreduce_flydsl_rmsnorm_delegation():
+    quick_reduce = _make_quick_allreduce_for_test()
+
+    class FakeFlyRMS:
+        def __init__(self):
+            self.closed = False
+            self.primed = []
+
+        def should_fly_fused_ar_rms(self, inp, residual, weight):
+            return inp.shape[0] <= 24
+
+        def fly_fused_ar_rms(self, inp, residual, weight, eps):
+            return inp + 2, residual + 3
+
+        def prime(self, hidden_dim):
+            self.primed.append(hidden_dim)
+            return True
+
+        def close(self):
+            self.closed = True
+
+    fake_fly = FakeFlyRMS()
+    quick_reduce._fly_rms = fake_fly
+
+    assert hasattr(quick_reduce, "_FLY_FUSED_MIN_TOKENS")
+    assert quick_reduce._FLY_FUSED_MIN_TOKENS == 16
+
+    # Sub-threshold: M=4 (< 16) -> declined by token gating
+    inp_sub = torch.randn(4, 7168, dtype=torch.bfloat16)
+    res_sub = torch.randn_like(inp_sub)
+    weight = torch.randn(7168, dtype=torch.bfloat16)
+    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_sub, res_sub, weight)
+
+    # Eligible: M=16 (>= 16 and <= 24) -> accepted
+    inp_eligible = torch.randn(16, 7168, dtype=torch.bfloat16)
+    res_eligible = torch.randn_like(inp_eligible)
+    assert quick_reduce.should_fly_allreduce_rmsnorm(inp_eligible, res_eligible, weight)
+
+    # Oversized for backend: M=32 (> 24) -> declined by FakeFlyRMS
+    inp_large = torch.randn(32, 7168, dtype=torch.bfloat16)
+    res_large = torch.randn_like(inp_large)
+    assert not quick_reduce.should_fly_allreduce_rmsnorm(inp_large, res_large, weight)
+
+    out, res_out = quick_reduce.quick_all_reduce_rmsnorm(
+        inp_eligible, res_eligible, weight, 1e-6, 7168
+    )
+    torch.testing.assert_close(out, inp_eligible + 2)
+    torch.testing.assert_close(res_out, res_eligible + 3)
+
+    with pytest.raises(
+        RuntimeError, match="FlyDSL fused AR\\+RMSNorm was called when not eligible"
+    ):
+        quick_reduce.quick_all_reduce_rmsnorm(inp_large, res_large, weight, 1e-6, 7168)
+
+    assert quick_reduce.prime_fly_fused_rmsnorm(7168) is True
+    assert fake_fly.primed == [7168]
+
+    quick_reduce.close()
+    assert fake_fly.closed is True
+    assert quick_reduce._fly_rms is None
+
+
+def test_rocm_aiter_fused_rmsnorm_dispatches_flydsl_fused_rmsnorm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+
+    class FakeQuickReduce:
+        disabled = False
+
+        def should_fly_allreduce_rmsnorm(self, inp, residual, weight):
+            return True
+
+        def quick_all_reduce_rmsnorm(self, inp, residual, weight, eps, hidden_dim):
+            calls.append(
+                {
+                    "inp": inp,
+                    "residual": residual,
+                    "weight": weight,
+                    "eps": eps,
+                    "hidden_dim": hidden_dim,
+                }
+            )
+            return inp + 10, residual + 20
+
+    qr_comm = FakeQuickReduce()
+    device_comm = SimpleNamespace(cpu_group=object(), qr_comm=qr_comm)
+    monkeypatch.setattr(
+        vllm_distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=device_comm),
+    )
+
+    inp = torch.randn(4, 7168, dtype=torch.bfloat16)
+    residual = torch.randn_like(inp)
+    weight = torch.randn(7168, dtype=torch.bfloat16)
+
+    out, res_out = aiter_ops._rocm_aiter_fused_allreduce_rmsnorm_impl(
+        inp, residual, weight, 1e-6, gemma_norm=False
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["inp"] is inp
+    assert calls[0]["hidden_dim"] == 7168
+    torch.testing.assert_close(out, inp + 10)
+    torch.testing.assert_close(res_out, residual + 20)
+
+
+def test_rocm_aiter_fused_rmsnorm_falls_back_to_separate_cdr_for_large_decode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeAiterAllReduce:
+        aiter_ca = SimpleNamespace(world_size=8, fully_connected=True)
+
+        def use_1stage_fused_ar_rms(self, inp):
+            return False
+
+        def custom_fused_ar_rms(self, *args, **kwargs):
+            raise AssertionError("2-stage fused CDR should not be called!")
+
+    class FakeQuickReduce:
+        disabled = False
+
+        def should_fly_allreduce_rmsnorm(self, inp, residual, weight):
+            return False
+
+        def should_quick_allreduce(self, inp):
+            return False
+
+    qr_comm = FakeQuickReduce()
+    device_comm = SimpleNamespace(cpu_group=object(), qr_comm=qr_comm)
+    monkeypatch.setattr(
+        vllm_distributed,
+        "get_tp_group",
+        lambda: SimpleNamespace(device_communicator=device_comm),
+    )
+    monkeypatch.setattr(
+        aiter_ops.rocm_aiter_ops,
+        "get_aiter_allreduce",
+        lambda: FakeAiterAllReduce(),
+    )
+
+    allreduce_calls = []
+    fused_add_rms_calls = []
+
+    monkeypatch.setattr(
+        vllm_distributed,
+        "tensor_model_parallel_all_reduce",
+        lambda inp: allreduce_calls.append(inp) or (inp + 100),
+    )
+
+    fake_ops_vllm_aiter = SimpleNamespace()
+
+    def fake_fused_add_rms_norm(x, residual, weight, eps, gemma_norm):
+        fused_add_rms_calls.append(
+            {
+                "x": x,
+                "residual": residual,
+                "weight": weight,
+                "eps": eps,
+                "gemma_norm": gemma_norm,
+            }
+        )
+        return x + 1, residual + 2
+
+    fake_ops_vllm_aiter.fused_add_rms_norm = fake_fused_add_rms_norm
+    monkeypatch.setattr(torch.ops, "vllm_aiter", fake_ops_vllm_aiter)
+
+    # M=12, hidden_dim=7168 (168 KiB > 128 KiB)
+    inp = torch.randn(12, 7168, dtype=torch.bfloat16)
+    residual = torch.randn_like(inp)
+    weight = torch.randn(7168, dtype=torch.bfloat16)
+
+    out, res_out = aiter_ops._rocm_aiter_fused_allreduce_rmsnorm_impl(
+        inp, residual, weight, 1e-6
+    )
+
+    assert len(allreduce_calls) == 1
+    assert allreduce_calls[0] is inp
+    assert len(fused_add_rms_calls) == 1
+    assert fused_add_rms_calls[0]["residual"] is residual
+    torch.testing.assert_close(out, inp + 101)
+    torch.testing.assert_close(res_out, residual + 2)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
