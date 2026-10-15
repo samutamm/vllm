@@ -194,7 +194,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Based on quickreduce (https://github.com/mk1-project/quickreduce).
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
-            self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+            self.qr_comm = QuickAllReduce(
+                group=self.cpu_group,
+                device=self.device,
+                vllm_config=config,
+            )
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()

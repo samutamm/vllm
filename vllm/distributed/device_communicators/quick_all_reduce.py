@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 from enum import Enum
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -9,6 +11,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
@@ -42,6 +45,9 @@ MB = 1024 * KB
 
 
 class QuickAllReduce:
+    _fly_rms: Any = None
+    _FLY_FUSED_MIN_TOKENS: int = 1
+    _FLY_FUSED_MAX_TOKENS: int = 512
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
@@ -61,7 +67,12 @@ class QuickAllReduce:
         ],
     }
 
-    def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: int | str | torch.device,
+        vllm_config: Any | None = None,
+    ) -> None:
         """Custom allreduce provides non-destructive acceleration and is
         available for CUDA and ROCm MI300 series.
 
@@ -82,6 +93,8 @@ class QuickAllReduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bound to f"cuda:{local_rank}".
+            vllm_config: optional VllmConfig instance for configuring model
+                dimensions and compilation parameters.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -163,9 +176,11 @@ class QuickAllReduce:
             )
             return
 
-        self.init_quick_all_reduce()
+        self.init_quick_all_reduce(vllm_config)
 
-    def init_quick_all_reduce(self):
+    def init_quick_all_reduce(self, vllm_config: Any | None = None):
+        if vllm_config is None:
+            vllm_config = get_current_vllm_config_or_none()
         # On RocM, bfloat16 kernels are slower than fp16
         # due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
@@ -206,7 +221,8 @@ class QuickAllReduce:
             return
 
         self.qr_quantization_min_size = self._get_qr_quantization_min_size()
-        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            vllm_config = get_current_vllm_config_or_none()
         if (
             vllm_config is not None
             and hasattr(vllm_config, "model_config")
@@ -256,7 +272,36 @@ class QuickAllReduce:
                 self.qr_quantization_min_size // KB,
             )
         self.create_shared_buffer()
+        if envs.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL:
+            self._init_flydsl(vllm_config)
         self.disabled = False
+
+    def _init_flydsl(self, vllm_config=None):
+        if not rocm_aiter_ops.is_flydsl_quick_reduce_enabled():
+            logger.warning(
+                "VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL requires VLLM_ROCM_USE_AITER=1; "
+                "using the HIP QuickReduce kernels."
+            )
+            return
+
+        # Fused AR+RMSNorm operates on bit-exact BF16, independent of qr_quant_level
+        hiddens = ()
+        if vllm_config is not None:
+            if vllm_config.model_config is not None:
+                with contextlib.suppress(Exception):
+                    hiddens = (vllm_config.model_config.get_hidden_size(),)
+            if getattr(vllm_config, "compilation_config", None) is not None:
+                with contextlib.suppress(Exception):
+                    max_capture = (
+                        vllm_config.compilation_config.max_cudagraph_capture_size
+                    )
+                    if max_capture is not None and max_capture > 0:
+                        self._FLY_FUSED_MAX_TOKENS = max_capture
+        self._fly_rms = rocm_aiter_ops.create_flydsl_allreduce_rmsnorm(
+            group=self.group,
+            device=self.device,
+            hiddens=hiddens,
+        )
 
     @staticmethod
     def _get_qr_min_size(qr_max_size: int | None) -> int | None:
@@ -353,8 +398,55 @@ class QuickAllReduce:
             return QuickReduceRegime.FP.value
         return self.qr_quant_level.value
 
+    def should_fly_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        """Whether the FlyDSL fused AR+RMSNorm backend can serve this call."""
+        if self._fly_rms is None:
+            return False
+
+        hidden_dim = inp.shape[-1]
+        if hidden_dim == 0 or inp.numel() == 0:
+            return False
+        num_tokens = inp.numel() // hidden_dim
+        if (
+            num_tokens < self._FLY_FUSED_MIN_TOKENS
+            or num_tokens > self._FLY_FUSED_MAX_TOKENS
+        ):
+            return False
+
+        return self._fly_rms.should_fly_fused_ar_rms(inp, residual_inp, weight)
+
+    def quick_all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        hidden_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Performs FlyDSL fused all-reduce with residual add and RMSNorm."""
+        if self.should_fly_allreduce_rmsnorm(inp, residual_inp, weight):
+            return self._fly_rms.fly_fused_ar_rms(inp, residual_inp, weight, eps)
+        raise RuntimeError("FlyDSL fused AR+RMSNorm was called when not eligible")
+
+    def prime_fly_fused_rmsnorm(self, hidden_dim: int) -> bool:
+        """Pre-allocates inboxes and JIT-compiles fused AR+RMSNorm for hidden_dim."""
+        if self._fly_rms is None:
+            return False
+        return self._fly_rms.prime(hidden_dim)
+
     def close(self):
-        if not self.disabled and getattr(self, "_ptr", None):
+        if getattr(self, "_fly_rms", None) is not None:
+            self._fly_rms.close()
+            self._fly_rms = None
+        if getattr(self, "_flydsl_int4", None) is not None:
+            self._flydsl_int4.close()
+            self._flydsl_int4 = None
+        if not getattr(self, "disabled", True) and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
             self._ptr = 0

@@ -1103,16 +1103,33 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     epsilon: float,
     gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    try:
+        from vllm.distributed import get_tp_group
+
+        device_comm = get_tp_group().device_communicator
+        qr_comm = getattr(device_comm, "qr_comm", None)
+    except Exception:
+        device_comm = None
+        qr_comm = None
+
+    # FlyDSL Fused AR + RMSNorm for small decode payloads (<= 128 KiB)
+    if (
+        not gemma_norm
+        and qr_comm is not None
+        and not getattr(qr_comm, "disabled", True)
+        and hasattr(qr_comm, "should_fly_allreduce_rmsnorm")
+        and qr_comm.should_fly_allreduce_rmsnorm(input_, residual, weight)
+    ):
+        return qr_comm.quick_all_reduce_rmsnorm(
+            input_, residual, weight, epsilon, input_.shape[-1]
+        )
+
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
     ca = aiter_ar.aiter_ca
     use_1stage = aiter_ar.use_1stage_fused_ar_rms(input_)
 
     if not use_1stage:
-        from vllm.distributed import get_tp_group
-
-        device_comm = get_tp_group().device_communicator
-        qr_comm = getattr(device_comm, "qr_comm", None)
         hidden_dim = input_.shape[-1]
         row_size = hidden_dim * input_.element_size()
         fused_qr_rmsnorm_ok = (
@@ -2044,6 +2061,7 @@ class rocm_aiter_ops:
     # Chunk length the AITER FlyDSL K5 prefill kernels are compiled for.
     GDN_FLYDSL_CHUNK_SIZE = 64
     _CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
+    _FLYDSL_QUICK_REDUCE_ENABLED = envs.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
@@ -2077,6 +2095,7 @@ class rocm_aiter_ops:
         """
         cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
         cls._CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
+        cls._FLYDSL_QUICK_REDUCE_ENABLED = envs.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL
         cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
@@ -2306,6 +2325,29 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_custom_all_reduce_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._CUSTOM_ALL_REDUCE_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def is_flydsl_quick_reduce_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._FLYDSL_QUICK_REDUCE_ENABLED
+
+    @staticmethod
+    def create_flydsl_allreduce_rmsnorm(
+        *, group: Any, device: Any, hiddens: tuple[int, ...] = ()
+    ) -> Any:
+        try:
+            from aiter.dist.device_communicators.quick_all_reduce import (
+                FlyDSLAllReduceRMSNorm,
+            )
+
+            comm = FlyDSLAllReduceRMSNorm(group=group, device=device, hiddens=hiddens)
+            if getattr(comm, "disabled", False):
+                comm.close()
+                return None
+            return comm
+        except Exception as e:
+            logger.warning("Failed to create FlyDSLAllReduceRMSNorm: %s", e)
+            return None
 
     @classmethod
     @if_aiter_supported
