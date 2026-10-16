@@ -18,6 +18,10 @@ import torch.nn.functional as F
 from transformers import Kimi_K25VisionConfig
 from transformers.activations import GELUActivation
 
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
@@ -183,6 +187,14 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         return x + self.get_pos_embeds(grid_thws)
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "x": 0,
+        "pos_embeds": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class MoonVision3dPatchEmbed(nn.Module):
     """3D patch embedding for vision tower."""
 
@@ -366,6 +378,16 @@ def _make_vision_norm(norm_type: str, hidden_dim: int) -> nn.Module:
     raise NotImplementedError(f"Not support norm_type: {norm_type}")
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "hidden_states": 0,
+        "cu_seqlens": 0,
+        "rope_freqs_cis": 0,
+        "sequence_lengths": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class MoonViTEncoderLayer(nn.Module):
     """Single encoder layer for MoonViT with TP/DP support."""
 
@@ -785,9 +807,10 @@ class MoonViT3dPretrainedModel(nn.Module):
                 None,
                 encoder_metadata=encoder_metadata,
             )
-            merge_gather_idx = encoder_metadata["merge_gather_idx"]
-            assert merge_gather_idx is not None
-            return tpool_patch_merger_packed(hidden_states, merge_gather_idx)
+            merge_gather_idx = encoder_metadata.get("merge_gather_idx")
+            if merge_gather_idx is not None:
+                return tpool_patch_merger_packed(hidden_states, merge_gather_idx)
+            return hidden_states
 
         assert grid_thws is not None
         grid_thw_list = grid_thws if isinstance(grid_thws, list) else grid_thws.tolist()
@@ -888,6 +911,13 @@ def vision_tower_forward(
     return list(tensors)
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "image_features": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class KimiK25MultiModalProjector(nn.Module):
     """Multi-modal projector with patch merging for Kimi-K2.5."""
 
@@ -959,3 +989,23 @@ class KimiK25MultiModalProjector(nn.Module):
         hidden_states = self.act(hidden_states)
         hidden_states, _ = self.linear_2(hidden_states)
         return hidden_states
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "hidden_states": 0,
+        "merge_gather_idx": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
+class KimiVisionPatchMergerProjector(nn.Module):
+    def __init__(self, projector: KimiK25MultiModalProjector):
+        super().__init__()
+        self.projector = projector
+
+    def forward(
+        self, hidden_states: torch.Tensor, merge_gather_idx: torch.Tensor
+    ) -> torch.Tensor:
+        pooled = hidden_states[merge_gather_idx]
+        return self.projector(pooled)
