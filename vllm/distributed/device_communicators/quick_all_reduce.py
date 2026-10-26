@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -60,6 +61,12 @@ class QuickAllReduce:
             2048 * MB,
         ],
     }
+    # AITER's FlyDSL INT4 schedules, when they serve QuickReduce instead of
+    # the HIP kernels (VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL): plain all-reduce,
+    # and all-reduce fused with residual add + RMSNorm.
+    _fly_ar: Any = None
+    _fly_rms: Any = None
+    _flydsl_int4: Any = None
 
     def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
         """Custom allreduce provides non-destructive acceleration and is
@@ -75,7 +82,9 @@ class QuickAllReduce:
         Its initialization requires even stricter conditions.
 
         Only the ROCm MI300 series is supported for quick allreduce at
-        this time.
+        this time. The HIP kernels need GPUs fully connected by xGMI beyond
+        two ranks; AITER's FlyDSL INT4 schedules
+        (VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL) also run over PCIe.
 
         Args:
             group: the process group to work on. If None, it will use the
@@ -94,7 +103,8 @@ class QuickAllReduce:
             )
             return
 
-        if not quick_ar:
+        use_flydsl = envs.VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL
+        if not quick_ar and not use_flydsl:
             # disable because of missing quick reduce library
             # e.g. in a cuda environment
             logger.info(
@@ -139,6 +149,17 @@ class QuickAllReduce:
         assert isinstance(device, torch.device)
         self.device = device
 
+        # The FlyDSL schedules choose their transport per link, so the xGMI
+        # requirement of the HIP kernels below does not apply to them.
+        if use_flydsl and self._init_flydsl():
+            return
+        if not quick_ar:
+            logger.info(
+                "Custom quick allreduce is disabled because "
+                "of missing custom quick allreduce library"
+            )
+            return
+
         # device.index is a visible ordinal, not a logical local ID.
         physical_device_id = current_platform.visible_device_id_to_physical_device_id(
             device.index
@@ -164,6 +185,82 @@ class QuickAllReduce:
             return
 
         self.init_quick_all_reduce()
+
+    @property
+    def uses_flydsl(self) -> bool:
+        """Whether AITER's FlyDSL schedules serve this communicator."""
+        return self._fly_ar is not None or self._fly_rms is not None
+
+    def _init_flydsl(self) -> bool:
+        """Serve QuickReduce with AITER's FlyDSL INT4 schedules.
+
+        AITER's policy picks the schedule (mesh or ring) and its payload window
+        per arch, link and world size, and declines the sizes its exact
+        one-shot serves through the AITER custom all-reduce. Returns whether
+        the schedules took over; when not, the HIP kernels are tried.
+        """
+        regime_str = envs.VLLM_ROCM_QUICK_REDUCE_QUANTIZATION
+        if regime_str != QuickReduceRegime.INT4.name:
+            logger.warning(
+                "VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL only supports INT4 "
+                "QuickReduce; using the HIP QuickReduce kernels for %s.",
+                regime_str,
+            )
+            return False
+        try:
+            from aiter.dist.device_communicators.flydsl_backends import (
+                FlyDSLAllReduceRMSNorm,
+                FlyDSLQuickAllReduce,
+            )
+        except ImportError:
+            logger.warning(
+                "VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL is set, but this AITER "
+                "build has no FlyDSL QuickReduce; using the HIP QuickReduce "
+                "kernels."
+            )
+            return False
+
+        # Building the fused engines for the model's width now keeps the build
+        # out of graph capture.
+        hiddens: tuple[int, ...] = ()
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is not None:
+            hiddens = (model_config.get_hidden_size(),)
+
+        # Both constructors are collective, and every rank declines together.
+        fly_ar = FlyDSLQuickAllReduce(
+            self.group, self.device, quantization=QuickReduceRegime.INT4.name
+        )
+        fly_rms = FlyDSLAllReduceRMSNorm(
+            self.group, self.device, quantized=True, hiddens=hiddens
+        )
+        if fly_ar.disabled:
+            fly_ar.close()
+            fly_ar = None
+        if fly_rms.disabled:
+            fly_rms.close()
+            fly_rms = None
+        if fly_ar is None and fly_rms is None:
+            logger.warning(
+                "VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL is set, but AITER declined "
+                "the FlyDSL QuickReduce (it needs AITER_FLY_AR=1 and a policy "
+                "for this arch, link and world size); using the HIP "
+                "QuickReduce kernels."
+            )
+            return False
+
+        self._fly_ar = fly_ar
+        self._fly_rms = fly_rms
+        self.qr_quant_level = QuickReduceRegime.INT4
+        self.disabled = False
+        logger.info(
+            "Custom quick allreduce: AITER FlyDSL INT4 serves plain all-reduce: "
+            "%s, fused all-reduce + RMSNorm: %s.",
+            fly_ar is not None,
+            fly_rms is not None,
+        )
+        return True
 
     def init_quick_all_reduce(self):
         # On RocM, bfloat16 kernels are slower than fp16
@@ -314,6 +411,8 @@ class QuickAllReduce:
         """Check if quickreduce is available."""
         if self.disabled:
             return False
+        if self.uses_flydsl:
+            return self._fly_ar is not None and self._fly_ar.should_fly_ar(inp)
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -337,12 +436,60 @@ class QuickAllReduce:
         """Performs an out-of-place custom quick all reduce."""
         # quick allreduce doesn't require a separate graph mode,
         # as QR uses static IPC buffer.
+        if self.uses_flydsl:
+            assert self._fly_ar is not None
+            return self._fly_ar.fly_ar(inp, out=out)
         if out is None:
             out = torch.empty_like(inp)
+        if self._use_flydsl_int4(inp):
+            self._flydsl_int4.allreduce(inp, out)
+            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self._get_qr_quant_level(inp), self.use_fp16_kernels
         )
         return out
+
+    def _use_flydsl_int4(self, inp: torch.Tensor) -> bool:
+        return (
+            self._flydsl_int4 is not None
+            and inp.dtype == torch.bfloat16
+            and inp.is_contiguous()
+            and inp.data_ptr() % 16 == 0
+            and self._get_qr_quant_level(inp) == QuickReduceRegime.INT4.value
+        )
+
+    def uses_flydsl_int4(self, inp: torch.Tensor) -> bool:
+        """Whether all_reduce runs inp through FlyDSL QuickReduce."""
+        if self.uses_flydsl:
+            return self.should_quick_allreduce(inp)
+        return self.should_quick_allreduce(inp) and self._use_flydsl_int4(inp)
+
+    def should_fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        gemma_norm: bool = False,
+    ) -> bool:
+        """Whether the FlyDSL schedules can fuse the residual add + RMSNorm."""
+        if self.disabled or self._fly_rms is None or gemma_norm:
+            return False
+        return self._fly_rms.should_fly_fused_ar_rms(inp, residual, weight)
+
+    def fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """FlyDSL INT4 all-reduce of ``inp`` fused with add + RMSNorm.
+
+        Returns ``(rmsnorm(allreduce(inp) + residual), allreduce(inp) +
+        residual)``. Only call when ``should_fused_allreduce_rmsnorm`` agreed.
+        """
+        assert self._fly_rms is not None
+        return self._fly_rms.fly_fused_ar_rms(inp, residual, weight, epsilon)
 
     def _get_qr_quant_level(self, inp: torch.Tensor) -> int:
         quantization_min_size = self.qr_quantization_min_size
@@ -354,9 +501,25 @@ class QuickAllReduce:
         return self.qr_quant_level.value
 
     def close(self):
+        if self.uses_flydsl:
+            for fly in (self._fly_ar, self._fly_rms):
+                if fly is not None:
+                    fly.close()
+            self._fly_ar = None
+            self._fly_rms = None
+            # Without this, should_quick_allreduce() would fall through to the
+            # HIP path with no communicator behind it.
+            self.disabled = True
+            return
+        if self._flydsl_int4 is not None:
+            self._flydsl_int4.close()
+            self._flydsl_int4 = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
-                ops.qr_destroy(self._ptr)
+                try:
+                    ops.qr_destroy(self._ptr)
+                except Exception:
+                    pass
             self._ptr = 0
             self.disabled = True
 
