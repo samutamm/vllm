@@ -264,6 +264,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
+    VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL: bool = False
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MOONCAKE_CONNECTOR_TIMEOUT: float = 30.0
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1432,6 +1433,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QuickReduce. This does not affect QuickReduce eligibility.
     "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB": lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB", None)
+    ),
+    # Custom quick allreduce kernel for MI3* cards.
+    # If set to 1 with VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4, serve
+    # QuickReduce with AITER's FlyDSL INT4 mesh/ring schedules instead of the
+    # HIP kernels, for plain all-reduce and for the fused all-reduce + RMSNorm.
+    # AITER's policy picks the schedule and the payload windows per arch, link
+    # (xGMI or PCIe) and world size; tune them with the AITER_FLY_AR_*
+    # variables. Needs AITER_FLY_AR=1, and also works on PCIe-only GPUs.
+    "VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL": lambda: (
+        os.getenv("VLLM_ROCM_QUICK_REDUCE_USE_FLYDSL", "False").lower() in ("true", "1")
     ),
     # If set, enable multiprocessing in LLM for the V1 code path.
     "VLLM_ENABLE_V1_MULTIPROCESSING": lambda: bool(
