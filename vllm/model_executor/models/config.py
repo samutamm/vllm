@@ -538,6 +538,24 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+def _kimi_k3_rocm_cudagraph_capture_sizes() -> list[int]:
+    """Batch sizes to capture for Kimi-K3 on ROCm, in ascending order.
+
+    Wider and more coarsely strided than the platform default grid (which
+    stops at 512) so the step size grows with batch size and the total count
+    stays bounded: 1, 2, 4; multiples of 8 up to 248; multiples of 16 up to
+    512; multiples of 128 up to 1024; multiples of 64 up to 2048; multiples
+    of 256 up to 4096. Yields 79 sizes.
+    """
+    sizes = [1, 2, 4]
+    sizes += range(8, 256, 8)
+    sizes += range(256, 513, 16)
+    sizes += range(640, 1025, 128)
+    sizes += range(1088, 2049, 64)
+    sizes += range(2304, 4097, 256)
+    return sizes
+
+
 class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
     """Route MXFP4-checkpointed Kimi-K3 MoE experts to the MXFP4 interface.
 
@@ -569,6 +587,33 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
                 and quant_config.get("format") == "mxfp4-pack-quantized"
             ):
                 quant_config["quant_method"] = "mxfp4"
+
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_rocm():
+            return
+        # Dynamic speculative decoding scales the capture grid itself; don't
+        # override it here.
+        if vllm_config.speculative_config is not None:
+            return
+
+        compilation_config = vllm_config.compilation_config
+        # Only override when the user has not set either of
+        # cudagraph_capture_sizes or max_cudagraph_capture_size.
+        if (
+            compilation_config.cudagraph_capture_sizes is None
+            and compilation_config.max_cudagraph_capture_size is None
+        ):
+            compilation_config.cudagraph_capture_sizes = (
+                _kimi_k3_rocm_cudagraph_capture_sizes()
+            )
+            logger.info(
+                "Overriding cudagraph capture sizes to a wider grid (max %d) "
+                "for performance on ROCm.",
+                compilation_config.cudagraph_capture_sizes[-1],
+            )
 
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
