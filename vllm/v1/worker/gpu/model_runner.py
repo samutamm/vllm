@@ -54,6 +54,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 from vllm.model_executor.layers.quantization.online.lm_head import (
     refresh_quantized_lm_heads,
 )
+from vllm.model_executor.layers.utils import warmup_rocm_skinny_gemm_workspaces
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload.inplace import reload_weights
 from vllm.model_executor.models.interfaces import requires_raw_input_tokens
@@ -1158,6 +1159,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return 0
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
+
+        if current_platform.is_rocm():
+            # wvSplitKrc cannot create its workspace pool inside a graph capture.
+            warmup_rocm_skinny_gemm_workspaces(self.device)
 
         start_time = time.perf_counter()
         with freeze_gc_for_cudagraph_capture():
