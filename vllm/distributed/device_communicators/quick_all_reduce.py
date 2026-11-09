@@ -283,6 +283,25 @@ class QuickAllReduce:
             flydsl_int4.preload()
             flydsl_int4.allreduce(warmup, torch.empty_like(warmup))
         torch.accelerator.synchronize(self.device)
+        if envs.VLLM_QR_INT4_SP:
+            if hasattr(flydsl_int4, "reduce_scatter"):
+                full = torch.empty(
+                    (16 * self.world_size, 2048),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                flydsl_int4.compile_sp(
+                    full,
+                    torch.empty((16, 2048), dtype=torch.bfloat16, device=self.device),
+                )
+                torch.accelerator.synchronize(self.device)
+                self._sp_int4 = flydsl_int4
+                logger.info("INT4 QuickReduce reduce-scatter/all-gather enabled.")
+            else:
+                logger.warning(
+                    "VLLM_QR_INT4_SP is set but the installed aiter has no INT4 "
+                    "reduce-scatter/all-gather; ignoring."
+                )
         logger.info(
             "Using AITER FlyDSL INT4 QuickReduce for BF16 payloads; other "
             "payloads use the HIP QuickReduce kernels."
@@ -396,6 +415,71 @@ class QuickAllReduce:
             and self._get_qr_quant_level(inp) == QuickReduceRegime.INT4.value
         )
 
+    _sp_int4: Any = None
+    _tile_bytes = 32 * KB
+
+    def _sp_shard_rows(self, shard: torch.Tensor) -> int | None:
+        """Shard rows after padding so the full tensor is a whole number of tiles,
+        or None if this payload should stay on RCCL."""
+        if (
+            self._sp_int4 is None
+            or shard.dtype != torch.bfloat16
+            or shard.dim() != 2
+            or not shard.is_contiguous()
+        ):
+            return None
+        row_bytes = shard.size(1) * shard.element_size() * self.world_size
+        full_bytes = shard.size(0) * row_bytes
+        min_dtype = torch.float16 if self.use_fp16_kernels else torch.bfloat16
+        min_size = self._QR_MIN_SIZE[(min_dtype, self.world_size)][
+            QuickReduceRegime.INT4.value
+        ]
+        if full_bytes < min_size or full_bytes > self.qr_max_size:
+            return None
+        rows = shard.size(0)
+        while (rows * row_bytes) % self._tile_bytes:
+            rows += 1
+            if rows - shard.size(0) > 64:
+                return None
+        return rows
+
+    def int4_all_gather(self, shard: torch.Tensor) -> torch.Tensor | None:
+        rows = self._sp_shard_rows(shard)
+        if rows is None:
+            return None
+        pad = rows - shard.size(0)
+        if pad:
+            shard = torch.nn.functional.pad(shard, (0, 0, 0, pad))
+        out = torch.empty(
+            (rows * self.world_size, shard.size(1)),
+            dtype=shard.dtype,
+            device=shard.device,
+        )
+        self._sp_int4.all_gather(shard, out)
+        if pad:
+            out = out.view(self.world_size, rows, -1)[:, : rows - pad].reshape(
+                -1, shard.size(1)
+            )
+        return out
+
+    def int4_reduce_scatter(self, full: torch.Tensor) -> torch.Tensor | None:
+        if full.dim() != 2 or full.size(0) % self.world_size:
+            return None
+        s = full.size(0) // self.world_size
+        rows = self._sp_shard_rows(full[:s])
+        if rows is None or not full.is_contiguous():
+            return None
+        pad = rows - s
+        if pad:
+            full = torch.nn.functional.pad(
+                full.view(self.world_size, s, -1), (0, 0, 0, pad)
+            ).reshape(-1, full.size(1))
+        out = torch.empty(
+            (rows, full.size(1)), dtype=full.dtype, device=full.device
+        )
+        self._sp_int4.reduce_scatter(full, out)
+        return out[:s] if pad else out
+
     def uses_flydsl_int4(self, inp: torch.Tensor) -> bool:
         """Whether `all_reduce` runs `inp` through FlyDSL QuickReduce."""
         return self.should_quick_allreduce(inp) and self._use_flydsl_int4(inp)
@@ -410,6 +494,7 @@ class QuickAllReduce:
         return self.qr_quant_level.value
 
     def close(self):
+        self._sp_int4 = None
         if self._flydsl_int4 is not None:
             self._flydsl_int4.close()
             self._flydsl_int4 = None

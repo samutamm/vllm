@@ -491,6 +491,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        if dim == 0 and self.qr_comm is not None and not self.qr_comm.disabled:
+            out = self.qr_comm.int4_all_gather(input_)
+            if out is not None:
+                return out
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -556,6 +560,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+
+        if dim == 0 and self.qr_comm is not None and not self.qr_comm.disabled:
+            out = self.qr_comm.int4_reduce_scatter(input_)
+            if out is not None:
+                return out
 
         # Note: This will produce an incorrect answer if we don't make
         # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?

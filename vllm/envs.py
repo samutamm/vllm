@@ -271,6 +271,7 @@ if TYPE_CHECKING:
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
     ] = "NONE"
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
+    VLLM_QR_INT4_SP: bool = False
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
@@ -1477,6 +1478,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "True").lower()
         in ("true", "1")
     ),
+    # Route sequence-parallel all-gather / reduce-scatter through the aiter FlyDSL
+    # INT4 QuickReduce kernels (lossy). Requires INT4 QuickReduce and an aiter
+    # with INT4 reduce-scatter/all-gather support.
+    "VLLM_QR_INT4_SP": lambda: bool(int(os.getenv("VLLM_QR_INT4_SP", "0"))),
     # Custom quick allreduce kernel for MI3* cards.
     # Controls the maximum allowed number of data bytes(MB) for custom quick
     # allreduce communication.
