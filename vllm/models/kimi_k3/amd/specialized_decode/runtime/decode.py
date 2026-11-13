@@ -26,6 +26,7 @@ from vllm.models.kimi_k3.amd.specialized_decode.runtime import (
     FFN,
     WHOLE,
     DecodeConfig,
+    kernel_linears,
     layer_kinds,
 )
 from vllm.models.kimi_k3.amd.specialized_decode.runtime.guards import (
@@ -212,6 +213,19 @@ class SpecializedDecode:
             list(config.widths),
             len(builds),
         )
+        copies = [
+            t
+            for i in kinds
+            for lin in kernel_linears(backbone.layers[i], kinds[i])
+            if (t := getattr(lin, "unquantized_weight", None)) is not None
+        ]
+        if copies:
+            logger.info(
+                "Kimi-K3 specialized decode: the layer kernels read %d bf16 copies "
+                "of online-FP8 linears (%.2f GiB a rank)",
+                len(copies),
+                sum(t.numel() * t.element_size() for t in copies) / 2**30,
+            )
 
     def _kv_key(self) -> tuple | None:
         """The first KDA layer's recurrent state by all but its number of slots:

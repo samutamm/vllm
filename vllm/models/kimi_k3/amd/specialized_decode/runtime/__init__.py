@@ -36,6 +36,9 @@ WHOLE, FFN = "whole", "ffn"
 # Kimi-K3's text shapes the kernels are written for (hidden size, routed experts,
 # KDA heads, KDA head dim, KDA short-conv width)
 K3_SHAPES = (7168, 896, 96, 128, 4)
+# additional_config key: the online-FP8 linears the layer kernels read keep a bf16
+# copy of their loaded weight (the kernels read bf16 only)
+BF16_COPIES = "specialized_decode_bf16_copies"
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,8 @@ class DecodeConfig:
     # the most requests a step has (spec verify: ``step_reasons`` caps its rows;
     # regular decode: unbounded, steps past MAX_ROWS run vLLM's decode)
     max_num_seqs: int = 1
+    # online-FP8 linears keep a bf16 copy for the kernels (``kernel_linears``)
+    bf16_copies: bool = False
 
     @property
     def widths(self) -> tuple[int, ...]:
@@ -104,7 +109,17 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         m1=not m1,
         interleave=vllm_config.parallel_config.cp_kv_cache_interleave_size,
         max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+        bf16_copies=bf16_copies(vllm_config),
     )
+
+
+def bf16_copies(vllm_config) -> bool:
+    """The `specialized_decode_bf16_copies` switch (a bool)."""
+    extra = vllm_config.additional_config
+    value = extra.get(BF16_COPIES, False) if isinstance(extra, dict) else False
+    if not isinstance(value, bool):
+        raise ValueError(f"{BF16_COPIES} must be true or false, got {value!r}")
+    return value
 
 
 def m1_reasons(vllm_config) -> list[str]:
@@ -341,3 +356,54 @@ def layer_kinds(config) -> dict[int, str]:
         elif i % block:
             out[i] = FFN
     return out
+
+
+def kernel_linears(layer, kind: str) -> list[torch.nn.Module]:
+    """The linears K1 / K2 read in a kernel layer that online FP8 quantizes: K1's
+    in_proj and f_b_proj, K2's o_proj, shared experts and latent down projection.
+    (The up projection and the router gate are never quantized online.)"""
+    mlp = layer.mlp
+    linears = [
+        layer.self_attn.o_proj,
+        mlp.routed_expert_down_proj,
+        mlp.shared_experts.gate_up_proj,
+        mlp.shared_experts.down_proj,
+    ]
+    if kind == WHOLE:
+        linears += [layer.self_attn.in_proj_qkvgfab, layer.self_attn.f_b_proj]
+    return linears
+
+
+def keep_bf16_copy(linear) -> None:
+    """Makes an online-FP8 per-channel `linear` keep a bf16 copy of its loaded
+    weight (`dense_weight`): wraps its own quant method's
+    `process_weights_after_loading`, which quantizes the weight in place. Any other
+    linear is left alone (its weight is read as it is)."""
+    from vllm.model_executor.layers.quantization.online.fp8 import (
+        Fp8PtpcOnlineLinearMethod,
+    )
+
+    method = getattr(linear, "quant_method", None)
+    if not isinstance(method, Fp8PtpcOnlineLinearMethod):
+        return
+    quantize = method.process_weights_after_loading
+
+    def process_weights_after_loading(layer) -> None:
+        if (
+            method.requantization_source is None
+            and layer.weight.dtype == torch.bfloat16
+            and not getattr(
+                layer, "_already_called_process_weights_after_loading", False
+            )
+        ):
+            layer.unquantized_weight = layer.weight.detach().clone()
+        quantize(layer)
+
+    method.process_weights_after_loading = process_weights_after_loading
+
+
+def dense_weight(linear) -> torch.Tensor:
+    """The bf16 weight a layer kernel reads: the copy an online-FP8 linear kept
+    (`kernel_linears`, `bf16_copies`), else its weight."""
+    copy = getattr(linear, "unquantized_weight", None)
+    return linear.weight if copy is None else copy

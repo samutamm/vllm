@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm.models.kimi_k3.amd.specialized_decode.runtime import DecodeConfig
+from vllm.models.kimi_k3.amd.specialized_decode.runtime import (
+    DecodeConfig,
+    keep_bf16_copy,
+    kernel_linears,
+    layer_kinds,
+)
 
 if TYPE_CHECKING:
     from vllm.models.kimi_k3.amd.specialized_decode.runtime.decode import (
@@ -32,6 +37,19 @@ class SpecializedDecodeMixin:
         stock decode."""
         self.specialized_decode_config = config
         self.specialized_decode = None
+
+    def keep_kernel_weight_copies(self) -> None:
+        """Called once `self.model` exists: the online-FP8 linears the layer
+        kernels read keep a bf16 copy of their loaded weight
+        (`DecodeConfig.bf16_copies`; `runtime.dense_weight` reads it)."""
+        config = self.specialized_decode_config
+        if config is None or not config.bf16_copies:
+            return
+        model = self.model
+        for i, kind in layer_kinds(model.config).items():
+            if model.start_layer <= i < model.end_layer:
+                for linear in kernel_linears(model.layers[i], kind):
+                    keep_bf16_copy(linear)
 
     def build_specialized_decode(self) -> None:
         from vllm.models.kimi_k3.amd.specialized_decode.runtime.decode import (

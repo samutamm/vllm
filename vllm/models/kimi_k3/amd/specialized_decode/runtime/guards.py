@@ -10,10 +10,12 @@ from typing import Any
 import torch
 
 from vllm.models.kimi_k3.amd.specialized_decode.runtime import (
+    BF16_COPIES,
     DCP,
     DCP_SIZES,
     FFN,
     FP8_KV,
+    dense_weight,
     layer_kinds,
 )
 
@@ -74,11 +76,12 @@ def weight_reasons(model) -> list[str]:
         H, LAT, E = moe.HIDDEN, moe.LAT, moe.E
         need(f"{p} gate", m.gate.weight, (E, H), bf)
         need(f"{p} gate bias", m.gate.e_score_correction_bias, (E,), f32)
-        need(f"{p} latent down", m.routed_expert_down_proj.weight, (LAT, H), bf)
+        need(f"{p} latent down", dense_weight(m.routed_expert_down_proj), (LAT, H), bf)
         need(f"{p} latent norm", m.routed_expert_norm.weight, (LAT,), bf)
-        need(f"{p} shared gate_up", m.shared_experts.gate_up_proj.weight,
+        need(f"{p} shared gate_up", dense_weight(m.shared_experts.gate_up_proj),
              (2 * moe.SI, H), bf)  # fmt: skip
-        need(f"{p} shared down", m.shared_experts.down_proj.weight, (H, moe.SI), bf)
+        need(f"{p} shared down", dense_weight(m.shared_experts.down_proj),
+             (H, moe.SI), bf)  # fmt: skip
         sharded = getattr(m.routed_output_transform, "row_sharded", False)
         need(f"{p} up_proj", m.routed_expert_up_proj.weight,
              (moe.UP_N if sharded else H, LAT), bf)  # fmt: skip
@@ -89,7 +92,7 @@ def weight_reasons(model) -> list[str]:
         need(f"{p} mlp_res_proj", layer.mlp_res_proj.weight, (1, H), bf)
         need(f"{p} post_attention_layernorm", layer.post_attention_layernorm.weight,
              (H,), bf)  # fmt: skip
-        need(f"{p} o_proj", layer.self_attn.o_proj.weight, (H, back.OK), bf)
+        need(f"{p} o_proj", dense_weight(layer.self_attn.o_proj), (H, back.OK), bf)
         need(f"{p} input_layernorm", layer.input_layernorm.weight, (H,), bf)
         need(f"{p} self_attention_res_norm", layer.self_attention_res_norm.weight,
              (H,), bf)  # fmt: skip
@@ -101,12 +104,17 @@ def weight_reasons(model) -> list[str]:
         if a.local_num_heads != kda.NH or a.head_dim != kda.HD or a.conv_size != 4:
             reasons.append(f"{p}: KDA heads/head_dim/conv_size")
             continue
-        need(f"{p} in_proj", a.in_proj_qkvgfab.weight, (kda.NPROJ, H), bf)
-        need(f"{p} f_b_proj", a.f_b_proj.weight, (kda.PROJ, kda.HD), bf)
+        need(f"{p} in_proj", dense_weight(a.in_proj_qkvgfab), (kda.NPROJ, H), bf)
+        need(f"{p} f_b_proj", dense_weight(a.f_b_proj), (kda.PROJ, kda.HD), bf)
         need(f"{p} o_norm", a.o_norm.weight, (kda.HD,), bf)
         need(f"{p} conv1d", a.conv1d.weight.view(-1, 4), (kda.QKV, 4), f32)
         need(f"{p} A_log", a.A_log.view(-1), (kda.NH,), f32)
         need(f"{p} dt_bias", a.dt_bias.view(-1), (kda.PROJ,), f32)
+    if any("torch.float8" in r for r in reasons):
+        reasons.append(
+            f"online-FP8 linears: set additional_config {BF16_COPIES}=true to keep "
+            "bf16 copies for the kernels (about 15 GiB more a rank)"
+        )
     return reasons
 
 

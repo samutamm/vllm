@@ -1297,6 +1297,7 @@ class KimiLinearForCausalLM(
         self.model = KimiLinearModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.keep_kernel_weight_copies()
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 self.config.vocab_size,
