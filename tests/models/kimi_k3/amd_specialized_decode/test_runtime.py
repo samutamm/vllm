@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi-K3's specialized decode on CPU: the switch, its widths and layers, its
-refusals (config, loaded weights, caches) and plan() routing."""
+"""Kimi-K3's specialized decode without running a model: the switch, its widths
+and layers, its refusals (config, loaded weights, caches) and plan() routing.
+Only the bf16-copy marking test needs a visible GPU (it uses dist_init)."""
 
 from types import SimpleNamespace
 
